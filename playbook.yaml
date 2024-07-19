@@ -1,0 +1,162 @@
+---
+- name: Deploy python container 
+  hosts: webservers
+  remote_user: your_user 
+  connection: "{{ 'local' if 'localhost' in inventory_hostname else 'ssh' }}"
+  become: true
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    remote_user: your_user
+    local_files_path: /home/{{ your_user }}/AnsibleProjects/Tortuga/Docker/
+    project_dest: /home/{{ your_user }}
+    docker_image_name: hello_world_python
+    docker_container_name: mybestwebsite
+    app_port: 6553  
+    check_url: "http://localhost:6553"  
+
+  tasks:
+    - name: Check Python 
+      ansible.builtin.command: python --version
+      register: python_installed
+      ignore_errors: true
+
+    - name: Add python candidate
+      ansible.builtin.apt_repository:
+        repo: ppa:deadsnakes/ppa
+        state: present
+      when: python_installed.failed
+
+    - name: Install Python packages 
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: true
+      loop:
+        - python3.11
+        - python3-pip
+      when: python_installed.failed
+
+    - name: Copy local files to remote server
+      when: inventory_hostname != "localhost" and inventory_hostname != "127.0.0.1"
+      local_action: command scp -r {{ local_files_path }} {{ remote_user }}@{{ inventory_hostname }}:{{ project_dest }}
+      become: false
+
+    - name: Check if Docker is installed
+      ansible.builtin.command: docker --version
+      register: docker_installed
+      ignore_errors: true
+    
+    - name: Update the apt package index
+      ansible.builtin.apt:
+        update_cache: yes
+      when: docker_installed.failed
+
+    - name: Install Docker related packages
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: true
+      loop:
+        - ca-certificates
+        - curl
+        - gnupg 
+        - lsb-release
+      when: docker_installed.failed
+
+    - name: Create directory for Docker's GPG key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      when: docker_installed.failed
+
+    - name: Add Docker's official GPG key
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /etc/apt/keyrings/docker.gpg
+        state: present
+      when: docker_installed.failed
+
+    - name: Chmod on docker.asc
+      ansible.builtin.file: 
+        path: /etc/apt/keyrings/docker.asc
+        state: directory
+        mode: 'a+r'
+      when: docker_installed.failed
+
+    - name: Print architecture variables
+      ansible.builtin.debug:
+        msg: "Architecture: {{ ansible_architecture }}, Codename: {{ ansible_lsb.codename }}"
+    
+    - name: Add Docker’s official GPG key
+      ansible.builtin.shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      when: docker_installed.failed
+    - name: Set up the Docker repository
+      ansible.builtin.shell: |
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      when: docker_installed.failed
+
+    - name: Install Docker and related components
+      ansible.builtin.apt:
+       name: "{{ item }}"
+       state: present
+       update_cache: true
+      loop:
+       - docker-ce
+       - docker-ce-cli
+       - containerd.io
+      when: docker_installed.failed
+
+    - name: Add Docker group
+      ansible.builtin.group:
+        name: docker
+        state: present
+      when: docker_installed.failed
+
+    - name: Add user to Docker group
+      ansible.builtin.user:
+        name: "{{ remote_user}}"
+        groups: docker
+        append: true
+      when: docker_installed.failed
+
+    - name: Enable and start Docker services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - docker.service
+        - containerd.service
+      when: docker_installed.failed
+
+
+    - name: Build Docker image
+      ansible.builtin.shell: |
+        cd {{ project_dest }}/Docker
+        docker build -t {{ docker_image_name }} -f Dockerfile . 
+      args:
+        chdir: "{{ project_dest }}"
+    
+    - name: Run Docker container
+      ansible.builtin.shell: |
+        docker run -d --name {{ docker_container_name }} -p {{ app_port }}:80 {{ docker_image_name }}
+      register: docker_run_command
+    
+    - name: Check if application is running
+      ansible.builtin.shell: |
+        curl -s -o /dev/null -w "%{http_code}" {{ check_url }}
+      register: curl_result
+      retries: 5
+      delay: 10
+      until: curl_result.stdout == "200"
+    
+    - name: Print curl check result
+      debug:
+        var: curl_result.stdout
+    
